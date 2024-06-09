@@ -1,0 +1,14 @@
+---
+- name: Delete Hetzner Server
+  hosts: localhost
+  gather_facts: false
+  vars:
+    hcloud_token: "{{ lookup('env', 'HCLOUD_TOKEN') }}"
+    server_name: "jira-server"
+
+  tasks:
+    - name: Delete Hetzner Cloud Server
+      hetzner.hcloud.hcloud_server:
+        api_token: "{{ hcloud_token }}"
+        name: "{{ server_name }}"
+        state: absent

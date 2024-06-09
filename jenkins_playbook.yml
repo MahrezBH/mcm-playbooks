@@ -1,0 +1,153 @@
+---
+- name: Provision Hetzner Server and Setup Jenkins with Nginx Reverse Proxy
+  hosts: localhost
+  gather_facts: false
+  vars:
+    hcloud_token: "{{ lookup('env', 'HCLOUD_TOKEN') }}"
+    server_name: "jenkins-server"
+    server_type: "cpx41" # Adjust server type as needed
+    image: "ubuntu-22.04"
+    ssh_key: "{{ lookup('env', 'SSH_KEY_NAME') }}"
+
+  tasks:
+    - name: Create Hetzner Cloud Server for Jenkins
+      hetzner.hcloud.hcloud_server:
+        api_token: "{{ hcloud_token }}"
+        name: "{{ server_name }}"
+        server_type: "{{ server_type }}"
+        image: "{{ image }}"
+        ssh_keys: "{{ ssh_key }}"
+        state: present
+      register: hcloud_server_jenkins
+
+    - name: Debug hcloud_server_jenkins variable
+      debug:
+        var: hcloud_server_jenkins
+
+    - name: Remove old SSH host key for Jenkins
+      known_hosts:
+        path: /home/mahrezbh/.ssh/known_hosts
+        name: "{{ hcloud_server_jenkins.hcloud_server.ipv4_address }}"
+        state: absent
+
+    - name: Add new SSH host key for Jenkins
+      shell: ssh-keyscan -H {{ hcloud_server_jenkins.hcloud_server.ipv4_address }} >> /home/mahrezbh/.ssh/known_hosts
+      ignore_errors: true
+
+    - name: Wait for SSH to be available on Jenkins server
+      wait_for:
+        host: "{{ hcloud_server_jenkins.hcloud_server.ipv4_address }}"
+        port: 22
+        delay: 10
+        timeout: 300
+        state: started
+
+    - name: Add Jenkins server to inventory
+      add_host:
+        name: jenkins-server
+        ansible_host: "{{ hcloud_server_jenkins.hcloud_server.ipv4_address }}"
+        ansible_user: root
+
+    - name: Refresh inventory
+      meta: refresh_inventory
+
+- name: Configure Jenkins and Nginx on new server
+  hosts: jenkins-server
+  become: true
+  tasks:
+    - name: Update and install Docker
+      apt:
+        update_cache: true
+        name: docker.io
+        state: present
+
+    - name: Install Docker Compose
+      apt:
+        name: docker-compose
+        state: present
+
+    - name: Ensure UFW is installed
+      apt:
+        name: ufw
+        state: present
+
+    - name: Allow ports 22, 80, and 443 through UFW
+      ufw:
+        rule: allow
+        port: "22,80,443"
+        proto: tcp
+
+    - name: Enable UFW
+      ufw:
+        state: enabled
+
+    - name: Create a Docker network
+      community.docker.docker_network:
+        name: jenkins_network
+
+    - name: Increase vm.max_map_count
+      sysctl:
+        name: vm.max_map_count
+        value: 262144
+        state: present
+        sysctl_set: true
+        reload: true
+
+    - name: Pull Jenkins Docker image
+      community.docker.docker_image:
+        name: jenkins/jenkins
+        tag: latest
+        source: pull
+
+    - name: Run Jenkins container
+      community.docker.docker_container:
+        name: jenkins
+        image: jenkins/jenkins
+        ports:
+          - "8080:8080"
+          - "50000:50000"
+        networks:
+          - name: jenkins_network
+        restart_policy: always
+
+    - name: Install Nginx
+      apt:
+        name: nginx
+        state: present
+
+    - name: Configure Nginx as reverse proxy for Jenkins
+      copy:
+        content: |
+          server {
+              listen 80;
+
+              server_name your_server_domain_or_IP;
+
+              location / {
+                  proxy_pass http://localhost:8080;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+        dest: /etc/nginx/sites-available/jenkins
+      notify:
+        - restart nginx
+
+    - name: Enable Nginx configuration
+      file:
+        src: /etc/nginx/sites-available/jenkins
+        dest: /etc/nginx/sites-enabled/jenkins
+        state: link
+
+    - name: Remove default Nginx configuration
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+  handlers:
+    - name: restart nginx
+      service:
+        name: nginx
+        state: restarted

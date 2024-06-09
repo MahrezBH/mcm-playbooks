@@ -1,0 +1,114 @@
+---
+- name: Provision Hetzner Server and Setup Nexus Repository Docker Container
+  hosts: localhost
+  gather_facts: false
+  vars:
+    hcloud_token: "{{ lookup('env', 'HCLOUD_TOKEN') }}"
+    server_name: "nexus-server"
+    server_type: "cx51" # Adjust server type as needed
+    image: "ubuntu-22.04"
+    ssh_key: "{{ lookup('env', 'SSH_KEY_NAME') }}"
+
+  tasks:
+    - name: Create Hetzner Cloud Server for Nexus
+      hetzner.hcloud.hcloud_server:
+        api_token: "{{ hcloud_token }}"
+        name: "{{ server_name }}"
+        server_type: "{{ server_type }}"
+        image: "{{ image }}"
+        ssh_keys: "{{ ssh_key }}"
+        state: present
+      register: hcloud_server_nexus
+
+    - name: Debug hcloud_server_nexus variable
+      debug:
+        var: hcloud_server_nexus
+
+    - name: Remove old SSH host key for Nexus
+      known_hosts:
+        path: /home/mahrezbh/.ssh/known_hosts
+        name: "{{ hcloud_server_nexus.hcloud_server.ipv4_address }}"
+        state: absent
+
+    - name: Add new SSH host key for Nexus
+      shell: ssh-keyscan -H {{ hcloud_server_nexus.hcloud_server.ipv4_address }} >> /home/mahrezbh/.ssh/known_hosts
+      ignore_errors: true
+
+    - name: Wait for SSH to be available on Nexus server
+      wait_for:
+        host: "{{ hcloud_server_nexus.hcloud_server.ipv4_address }}"
+        port: 22
+        delay: 10
+        timeout: 300
+        state: started
+
+    - name: Add Nexus server to inventory
+      add_host:
+        name: nexus-server
+        ansible_host: "{{ hcloud_server_nexus.hcloud_server.ipv4_address }}"
+        ansible_user: root
+
+    - name: Refresh inventory
+      meta: refresh_inventory
+
+- name: Configure Nexus Repository on new server
+  hosts: nexus-server
+  become: true
+  tasks:
+    - name: Update and install Docker
+      apt:
+        update_cache: true
+        name: docker.io
+        state: present
+
+    - name: Install Docker Compose
+      apt:
+        name: docker-compose
+        state: present
+
+    - name: Ensure UFW is installed
+      apt:
+        name: ufw
+        state: present
+
+    - name: Allow ports 22, 80, and 8081 through UFW
+      ufw:
+        rule: allow
+        port: "22,80,8081"
+        proto: tcp
+
+    - name: Enable UFW
+      ufw:
+        state: enabled
+
+    - name: Create a Docker network
+      community.docker.docker_network:
+        name: nexus_network
+
+    - name: Run Nexus Repository Manager container
+      community.docker.docker_container:
+        name: nexus
+        image: sonatype/nexus3
+        ports:
+          - "8081:8081"
+        env:
+          NEXUS_SECURITY_RANDOMPASSWORD: "false"
+        networks:
+          - name: nexus_network
+        restart_policy: always
+
+    - name: Pull Nexus Repository Docker image
+      community.docker.docker_image:
+        name: sonatype/nexus3
+        tag: latest
+        source: pull
+
+    - name: Run Nexus Repository container
+      community.docker.docker_container:
+        name: nexus
+        image: sonatype/nexus3
+        ports:
+          - "8081:8081"
+        networks:
+          - name: nexus_network
+        restart_policy: always

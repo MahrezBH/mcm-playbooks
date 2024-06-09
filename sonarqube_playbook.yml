@@ -1,0 +1,169 @@
+---
+- name: Provision Hetzner Server and Setup SonarQube Docker Container
+  hosts: localhost
+  gather_facts: false
+  vars:
+    hcloud_token: "{{ lookup('env', 'HCLOUD_TOKEN') }}"
+    server_name: "sonarqube-server"
+    server_type: "cpx41" # Adjust server type as needed
+    image: "ubuntu-22.04"
+    ssh_key: "{{ lookup('env', 'SSH_KEY_NAME') }}"
+
+  tasks:
+    - name: Create Hetzner Cloud Server for SonarQube
+      hetzner.hcloud.hcloud_server:
+        api_token: "{{ hcloud_token }}"
+        name: "{{ server_name }}"
+        server_type: "{{ server_type }}"
+        image: "{{ image }}"
+        ssh_keys: "{{ ssh_key }}"
+        state: present
+      register: hcloud_server_sonarqube
+
+    - name: Debug hcloud_server_sonarqube variable
+      debug:
+        var: hcloud_server_sonarqube
+
+    - name: Remove old SSH host key for SonarQube
+      known_hosts:
+        path: /home/mahrezbh/.ssh/known_hosts
+        name: "{{ hcloud_server_sonarqube.hcloud_server.ipv4_address }}"
+        state: absent
+
+    - name: Add new SSH host key for SonarQube
+      shell: ssh-keyscan -H {{ hcloud_server_sonarqube.hcloud_server.ipv4_address }} >> /home/mahrezbh/.ssh/known_hosts
+      ignore_errors: true
+
+    - name: Wait for SSH to be available on SonarQube server
+      wait_for:
+        host: "{{ hcloud_server_sonarqube.hcloud_server.ipv4_address }}"
+        port: 22
+        delay: 10
+        timeout: 300
+        state: started
+
+    - name: Add SonarQube server to inventory
+      add_host:
+        name: sonarqube-server
+        ansible_host: "{{ hcloud_server_sonarqube.hcloud_server.ipv4_address }}"
+        ansible_user: root
+
+    - name: Refresh inventory
+      meta: refresh_inventory
+
+- name: Configure SonarQube on new server
+  hosts: sonarqube-server
+  become: true
+  tasks:
+    - name: Update and install Docker
+      apt:
+        update_cache: true
+        name: docker.io
+        state: present
+
+    - name: Install Docker Compose
+      apt:
+        name: docker-compose
+        state: present
+
+    - name: Ensure UFW is installed
+      apt:
+        name: ufw
+        state: present
+
+    - name: Allow ports 22, 80, and 443 through UFW
+      ufw:
+        rule: allow
+        port: "22,80,443"
+        proto: tcp
+
+    - name: Enable UFW
+      ufw:
+        state: enabled
+
+    - name: Create a Docker network
+      community.docker.docker_network:
+        name: sonarqube_network
+
+    - name: Increase vm.max_map_count
+      sysctl:
+        name: vm.max_map_count
+        value: 262144
+        state: present
+        sysctl_set: true
+        reload: true
+
+    - name: Run PostgreSQL container for SonarQube
+      community.docker.docker_container:
+        name: sonarqube-db
+        image: postgres
+        ports:
+          - "5432:5432"
+        env:
+          POSTGRES_DB: "sonarqube"
+          POSTGRES_USER: "sonarqube"
+          POSTGRES_PASSWORD: "sonarqube"
+        networks:
+          - name: sonarqube_network
+        restart_policy: always
+
+    - name: Pull SonarQube Docker image
+      community.docker.docker_image:
+        name: sonarqube
+        tag: latest
+        source: pull
+
+    - name: Run SonarQube container
+      community.docker.docker_container:
+        name: sonarqube
+        image: sonarqube
+        ports:
+          - "9000:9000"
+        env:
+          SONAR_JDBC_URL: "jdbc:postgresql://sonarqube-db:5432/sonarqube"
+          SONAR_JDBC_USERNAME: "sonarqube"
+          SONAR_JDBC_PASSWORD: "sonarqube"
+        networks:
+          - name: sonarqube_network
+        restart_policy: always
+
+    - name: Install Nginx
+      apt:
+        name: nginx
+        state: present
+
+    - name: Configure Nginx as a reverse proxy for SonarQube
+      copy:
+        content: |
+          server {
+              listen 80 default_server;
+              listen [::]:80 default_server;
+
+              server_name _;
+
+              location / {
+                  proxy_pass http://localhost:9000;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+        dest: /etc/nginx/sites-available/sonarqube
+        mode: "0644"
+
+    - name: Enable Nginx configuration
+      file:
+        src: /etc/nginx/sites-available/sonarqube
+        dest: /etc/nginx/sites-enabled/sonarqube
+        state: link
+
+    - name: Remove default Nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Restart Nginx
+      service:
+        name: nginx
+        state: restarted

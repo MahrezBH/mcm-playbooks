@@ -1,0 +1,174 @@
+---
+- name: Provision Hetzner Server and Setup Mattermost Docker Container
+  hosts: localhost
+  gather_facts: false
+  vars:
+    hcloud_token: "{{ lookup('env', 'HCLOUD_TOKEN') }}"
+    server_name: "mattermost-server"
+    server_type: "cpx41" # Adjust server type as needed
+    image: "ubuntu-22.04"
+    ssh_key: "{{ lookup('env', 'SSH_KEY_NAME') }}"
+
+  tasks:
+    - name: Create Hetzner Cloud Server
+      hetzner.hcloud.hcloud_server:
+        api_token: "{{ hcloud_token }}"
+        name: "{{ server_name }}"
+        server_type: "{{ server_type }}"
+        image: "{{ image }}"
+        ssh_keys: "{{ ssh_key }}"
+        state: present
+      register: hcloud_server
+
+    - name: Debug hcloud_server variable
+      debug:
+        var: hcloud_server
+
+    - name: Remove old SSH host key
+      known_hosts:
+        path: /home/mahrezbh/.ssh/known_hosts
+        name: "{{ hcloud_server.hcloud_server.ipv4_address }}"
+        state: absent
+
+    - name: Add new SSH host key
+      shell: ssh-keyscan -H {{ hcloud_server.hcloud_server.ipv4_address }} >> /home/mahrezbh/.ssh/known_hosts
+      ignore_errors: true
+
+    - name: Wait for SSH to be available
+      wait_for:
+        host: "{{ hcloud_server.hcloud_server.ipv4_address }}"
+        port: 22
+        delay: 10
+        timeout: 300
+        state: started
+
+    - name: Add new server to inventory
+      add_host:
+        name: mattermost-server
+        ansible_host: "{{ hcloud_server.hcloud_server.ipv4_address }}"
+        ansible_user: root
+
+    - name: Refresh inventory
+      meta: refresh_inventory
+
+- name: Configure Mattermost on new server
+  hosts: mattermost-server
+  become: true
+  tasks:
+    - name: Update and install Docker
+      apt:
+        update_cache: true
+        name: docker.io
+        state: present
+
+    - name: Install Docker Compose
+      apt:
+        name: docker-compose
+        state: present
+
+    - name: Ensure UFW is installed
+      apt:
+        name: ufw
+        state: present
+
+    - name: Allow ports 22, 80, 443 through UFW
+      ufw:
+        rule: allow
+        port: "22,80,443"
+        proto: tcp
+
+    - name: Enable UFW
+      ufw:
+        state: enabled
+
+    - name: Create a Docker network
+      community.docker.docker_network:
+        name: mattermost_network
+
+    - name: Run PostgreSQL container for Mattermost
+      community.docker.docker_container:
+        name: mattermost-db
+        image: postgres
+        ports:
+          - "5432:5432"
+        env:
+          POSTGRES_DB: "mattermost"
+          POSTGRES_USER: "mattermost"
+          POSTGRES_PASSWORD: "mattermost"
+        networks:
+          - name: mattermost_network
+        restart_policy: always
+
+    - name: Run Redis container for Mattermost (optional)
+      community.docker.docker_container:
+        name: mattermost-redis
+        image: redis
+        ports:
+          - "6379:6379"
+        networks:
+          - name: mattermost_network
+        restart_policy: always
+
+    - name: Pull Mattermost Docker image
+      community.docker.docker_image:
+        name: mattermost/mattermost-enterprise-edition
+        tag: latest
+        source: pull
+
+    - name: Run Mattermost container
+      community.docker.docker_container:
+        name: mattermost
+        image: mattermost/mattermost-enterprise-edition
+        ports:
+          - "8065:8065"
+        env:
+          MM_USERNAME: "mattermost"
+          MM_PASSWORD: "mattermost"
+          MM_DBNAME: "mattermost"
+          MM_SQLSETTINGS_DRIVERNAME: "postgres"
+          MM_SQLSETTINGS_DATASOURCE: "postgres://mattermost:mattermost@mattermost-db:5432/mattermost?sslmode=disable"
+          MM_REDISSETTINGS_ADDRESS: "mattermost-redis:6379" # Optional
+        networks:
+          - name: mattermost_network
+        restart_policy: always
+
+    - name: Install Nginx
+      apt:
+        name: nginx
+        state: present
+
+    - name: Configure Nginx as a reverse proxy for Mattermost
+      copy:
+        content: |
+          server {
+              listen 80 default_server;
+              listen [::]:80 default_server;
+
+              server_name _;
+
+              location / {
+                  proxy_pass http://localhost:8065;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+        dest: /etc/nginx/sites-available/mattermost
+        mode: "0644"
+
+    - name: Enable Nginx configuration
+      file:
+        src: /etc/nginx/sites-available/mattermost
+        dest: /etc/nginx/sites-enabled/mattermost
+        state: link
+
+    - name: Remove default Nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Restart Nginx
+      service:
+        name: nginx
+        state: restarted

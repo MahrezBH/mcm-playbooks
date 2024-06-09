@@ -1,0 +1,112 @@
+---
+- name: Provision Hetzner Server from Snapshot and Start Vault Service
+  hosts: localhost
+  gather_facts: false
+  vars:
+    hcloud_token: "{{ lookup('env', 'HCLOUD_TOKEN') }}"
+    server_name: "vault-server"
+    server_type: "cpx41" # Adjust server type as needed
+    snapshot_id: "168776868" # Replace with the actual snapshot ID
+    ssh_key: "{{ lookup('env', 'SSH_KEY_NAME') }}"
+    unseal_keys_file: "/home/mahrezbh/Desktop/pfe/Workspace/playbooks/unseal_keys.json" # Path to the unseal keys file
+
+  tasks:
+    - name: Find existing server
+      hetzner.hcloud.hcloud_server_info:
+        api_token: "{{ hcloud_token }}"
+      register: existing_servers
+
+    - name: Create Hetzner Cloud Server from Snapshot
+      hetzner.hcloud.hcloud_server:
+        api_token: "{{ hcloud_token }}"
+        name: "{{ server_name }}"
+        server_type: "{{ server_type }}"
+        image: "{{ snapshot_id }}"
+        ssh_keys: "{{ ssh_key }}"
+        state: present
+      register: hcloud_server_vault
+
+    - name: Debug hcloud_server_vault variable
+      debug:
+        var: hcloud_server_vault
+
+    - name: Remove old SSH host key for Vault
+      known_hosts:
+        path: /home/mahrezbh/.ssh/known_hosts
+        name: "{{ hcloud_server_vault.hcloud_server.ipv4_address }}"
+        state: absent
+
+    - name: Add new SSH host key for Vault
+      shell: ssh-keyscan -H {{ hcloud_server_vault.hcloud_server.ipv4_address }} >> /home/mahrezbh/.ssh/known_hosts
+      ignore_errors: true
+
+    - name: Wait for SSH to be available on Vault server
+      wait_for:
+        host: "{{ hcloud_server_vault.hcloud_server.ipv4_address }}"
+        port: 22
+        delay: 10
+        timeout: 300
+        state: started
+
+    - name: Add Vault server to inventory
+      add_host:
+        name: vault-server
+        ansible_host: "{{ hcloud_server_vault.hcloud_server.ipv4_address }}"
+        ansible_user: root
+
+    - name: Refresh inventory
+      meta: refresh_inventory
+
+- name: Start and unseal Vault service on new server
+  hosts: vault-server
+  become: true
+  vars:
+    local_unseal_keys_file: "/home/mahrezbh/Desktop/pfe/Workspace/playbooks/unseal_keys.json" # Path to the unseal keys file on local machine
+    remote_unseal_keys_file: "/root/unseal_keys.json" # Path to copy the unseal keys file on the remote server
+  tasks:
+    - name: Enable and start Vault service
+      systemd:
+        name: vault
+        enabled: yes
+        state: started
+
+    - name: Copy unseal keys file to the remote server
+      copy:
+        src: "{{ local_unseal_keys_file }}"
+        dest: "{{ remote_unseal_keys_file }}"
+        mode: "0600"
+
+    - name: Read unseal keys from file
+      slurp:
+        src: "{{ remote_unseal_keys_file }}"
+      register: unseal_keys_content
+
+    - name: Set unseal keys
+      set_fact:
+        unseal_keys: "{{ (unseal_keys_content.content | b64decode | from_json).unseal_keys }}"
+
+    - name: Set VAULT_ADDR environment variable
+      shell: "export VAULT_ADDR=http://127.0.0.1:8200"
+      args:
+        executable: /bin/bash
+
+    - name: Unseal Vault with first key
+      command: "vault operator unseal {{ unseal_keys[0] }}"
+      environment:
+        VAULT_ADDR: "http://127.0.0.1:8200"
+      register: unseal_result1
+      # failed_when: "'Unseal Progress    1/3' not in unseal_result1.stdout and 'Sealed: false' not in unseal_result1.stdout"
+
+    - name: Unseal Vault with second key
+      command: "vault operator unseal {{ unseal_keys[1] }}"
+      environment:
+        VAULT_ADDR: "http://127.0.0.1:8200"
+      register: unseal_result2
+      # failed_when: "'Unseal Progress    2/3' not in unseal_result2.stdout and 'Sealed: false' not in unseal_result2.stdout"
+
+    - name: Unseal Vault with third key
+      command: "vault operator unseal {{ unseal_keys[2] }}"
+      environment:
+        VAULT_ADDR: "http://127.0.0.1:8200"
+      register: unseal_result3
+      # failed_when: "'Sealed: false' not in unseal_result3.stdout"

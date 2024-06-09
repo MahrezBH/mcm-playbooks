@@ -1,0 +1,153 @@
+---
+- name: Provision Hetzner Server and Setup HashiCorp Vault
+  hosts: localhost
+  gather_facts: false
+  vars:
+    hcloud_token: "{{ lookup('env', 'HCLOUD_TOKEN') }}"
+    server_name: "vault-server"
+    server_type: "cpx41" # Adjust server type as needed
+    image: "ubuntu-22.04"
+    ssh_key: "{{ lookup('env', 'SSH_KEY_NAME') }}"
+
+  tasks:
+    - name: Create Hetzner Cloud Server for Vault
+      hetzner.hcloud.hcloud_server:
+        api_token: "{{ hcloud_token }}"
+        name: "{{ server_name }}"
+        server_type: "{{ server_type }}"
+        image: "{{ image }}"
+        ssh_keys: "{{ ssh_key }}"
+        state: present
+      register: hcloud_server_vault
+
+    - name: Debug hcloud_server_vault variable
+      debug:
+        var: hcloud_server_vault
+
+    - name: Remove old SSH host key for Vault
+      known_hosts:
+        path: /home/mahrezbh/.ssh/known_hosts
+        name: "{{ hcloud_server_vault.hcloud_server.ipv4_address }}"
+        state: absent
+
+    - name: Add new SSH host key for Vault
+      shell: ssh-keyscan -H {{ hcloud_server_vault.hcloud_server.ipv4_address }} >> /home/mahrezbh/.ssh/known_hosts
+      ignore_errors: true
+
+    - name: Wait for SSH to be available on Vault server
+      wait_for:
+        host: "{{ hcloud_server_vault.hcloud_server.ipv4_address }}"
+        port: 22
+        delay: 10
+        timeout: 300
+        state: started
+
+    - name: Add Vault server to inventory
+      add_host:
+        name: vault-server
+        ansible_host: "{{ hcloud_server_vault.hcloud_server.ipv4_address }}"
+        ansible_user: root
+
+    - name: Refresh inventory
+      meta: refresh_inventory
+
+- name: Configure Vault on new server
+  hosts: vault-server
+  become: true
+  tasks:
+    - name: Update and install dependencies
+      apt:
+        name:
+          - unzip
+          - curl
+        state: present
+        update_cache: yes
+
+    - name: Create a system user and group for Vault
+      user:
+        name: "vault"
+        system: yes
+        shell: /bin/false
+
+    - name: Create directories for Vault
+      file:
+        path: "{{ item }}"
+        state: directory
+        owner: "vault"
+        group: "vault"
+        mode: 0755
+      with_items:
+        - "/etc/vault.d"
+        - "/opt/vault/data"
+
+    - name: Download Vault binary
+      get_url:
+        url: "https://releases.hashicorp.com/vault/1.10.0/vault_1.10.0_linux_amd64.zip"
+        dest: /tmp/vault.zip
+        mode: 0644
+
+    - name: Unzip Vault binary
+      unarchive:
+        src: /tmp/vault.zip
+        dest: /usr/local/bin/
+        remote_src: yes
+
+    - name: Set permissions on Vault binary
+      file:
+        path: /usr/local/bin/vault
+        state: file
+        owner: root
+        group: root
+        mode: "0755"
+
+    - name: Create Vault configuration file
+      copy:
+        content: |
+          storage "file" {
+            path = "/opt/vault/data"
+          }
+
+          listener "tcp" {
+            address     = "0.0.0.0:8200"
+            tls_disable = 1
+          }
+
+          disable_mlock = true
+        dest: "/etc/vault.d/vault.hcl"
+        owner: "vault"
+        group: "vault"
+        mode: "0644"
+
+    - name: Create systemd service file for Vault
+      copy:
+        content: |
+          [Unit]
+          Description=HashiCorp Vault
+          Documentation=https://www.vaultproject.io/docs/
+          Requires=network-online.target
+          After=network-online.target
+
+          [Service]
+          User=vault
+          Group=vault
+          ExecStart=/usr/local/bin/vault server -config=/etc/vault.d/vault.hcl
+          ExecReload=/bin/kill -HUP $MAINPID
+          KillSignal=SIGTERM
+          Restart=on-failure
+          LimitNOFILE=65536
+          StandardOutput=syslog
+          StandardError=syslog
+          SyslogIdentifier=vault
+
+          [Install]
+          WantedBy=multi-user.target
+        dest: /etc/systemd/system/vault.service
+        owner: root
+        group: root
+        mode: "0644"
+
+    - name: Enable and start Vault service
+      systemd:
+        name: vault
+        enabled: yes
+        state: started

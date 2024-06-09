@@ -1,0 +1,95 @@
+---
+- name: Provision Hetzner Servers from Snapshots
+  hosts: localhost
+  gather_facts: false
+  vars:
+    hcloud_token: "{{ lookup('env', 'HCLOUD_TOKEN') }}"
+    snapshot_ids:
+      - "166248590"
+      - "166245012"
+      - "167370349"
+    server_names:
+      - "GlitchTip server"
+      - "Mattermost server"
+    server_type: "cx51"
+    ssh_key: "{{ lookup('env', 'SSH_KEY_NAME') }}"
+
+  tasks:
+    - name: Create Hetzner Cloud Server from GlitchTip Snapshot
+      hetzner.hcloud.hcloud_server:
+        api_token: "{{ hcloud_token }}"
+        name: "{{ server_names[0] }}"
+        server_type: "{{ server_type }}"
+        image: "{{ snapshot_ids[0] }}"
+        ssh_keys: "{{ ssh_key }}"
+        state: present
+      register: hcloud_server_1
+
+    - name: Debug hcloud_server_1 variable
+      debug:
+        var: hcloud_server_1
+
+    - name: Create Hetzner Cloud Server from Mattermost Snapshot
+      hetzner.hcloud.hcloud_server:
+        api_token: "{{ hcloud_token }}"
+        name: "{{ server_names[1] }}"
+        server_type: "{{ server_type }}"
+        image: "{{ snapshot_ids[1] }}"
+        ssh_keys: "{{ ssh_key }}"
+        state: present
+      register: hcloud_server_2
+
+    - name: Debug hcloud_server_2 variable
+      debug:
+        var: hcloud_server_2
+
+    - name: Remove old SSH host key for server 1
+      known_hosts:
+        path: /home/mahrezbh/.ssh/known_hosts
+        name: "{{ hcloud_server_1.hcloud_server.ipv4_address }}"
+        state: absent
+
+    - name: Add new SSH host key for server 1
+      shell: ssh-keyscan -H {{ hcloud_server_1.hcloud_server.ipv4_address }} >> /home/mahrezbh/.ssh/known_hosts
+      ignore_errors: true
+
+    - name: Wait for SSH to be available on server 1
+      wait_for:
+        host: "{{ hcloud_server_1.hcloud_server.ipv4_address }}"
+        port: 22
+        delay: 10
+        timeout: 300
+        state: started
+
+    - name: Remove old SSH host key for server 2
+      known_hosts:
+        path: /home/mahrezbh/.ssh/known_hosts
+        name: "{{ hcloud_server_2.hcloud_server.ipv4_address }}"
+        state: absent
+
+    - name: Add new SSH host key for server 2
+      shell: ssh-keyscan -H {{ hcloud_server_2.hcloud_server.ipv4_address }} >> /home/mahrezbh/.ssh/known_hosts
+      ignore_errors: true
+
+    - name: Wait for SSH to be available on server 2
+      wait_for:
+        host: "{{ hcloud_server_2.hcloud_server.ipv4_address }}"
+        port: 22
+        delay: 10
+        timeout: 300
+        state: started
+
+    - name: Add new server 1 to inventory
+      add_host:
+        name: "{{ server_names[0] }}"
+        ansible_host: "{{ hcloud_server_1.hcloud_server.ipv4_address }}"
+        ansible_user: root
+
+    - name: Add new server 2 to inventory
+      add_host:
+        name: "{{ server_names[1] }}"
+        ansible_host: "{{ hcloud_server_2.hcloud_server.ipv4_address }}"
+        ansible_user: root
+
+    - name: Refresh inventory
+      meta: refresh_inventory

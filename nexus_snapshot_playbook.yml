@@ -1,0 +1,61 @@
+---
+- name: Provision Hetzner Server from Snapshot and Start Nexus Docker Container
+  hosts: localhost
+  gather_facts: false
+  vars:
+    hcloud_token: "{{ lookup('env', 'HCLOUD_TOKEN') }}"
+    server_name: "nexus-server"
+    server_type: "cpx41"
+    snapshot_id: "168202390" # Replace with your snapshot ID
+    ssh_key: "{{ lookup('env', 'SSH_KEY_NAME') }}"
+
+  tasks:
+    - name: Create Hetzner Cloud Server from Snapshot
+      hetzner.hcloud.hcloud_server:
+        api_token: "{{ hcloud_token }}"
+        name: "{{ server_name }}"
+        server_type: "{{ server_type }}"
+        image: "{{ snapshot_id }}"
+        ssh_keys: "{{ ssh_key }}"
+        state: present
+      register: hcloud_server
+
+    - name: Debug hcloud_server variable
+      debug:
+        var: hcloud_server
+
+    - name: Remove old SSH host key
+      known_hosts:
+        path: /home/mahrezbh/.ssh/known_hosts
+        name: "{{ hcloud_server.hcloud_server.ipv4_address }}"
+        state: absent
+
+    - name: Add new SSH host key
+      shell: ssh-keyscan -H {{ hcloud_server.hcloud_server.ipv4_address }} >> /home/mahrezbh/.ssh/known_hosts
+      ignore_errors: true
+
+    - name: Wait for SSH to be available
+      wait_for:
+        host: "{{ hcloud_server.hcloud_server.ipv4_address }}"
+        port: 22
+        delay: 10
+        timeout: 300
+        state: started
+
+    - name: Add new server to inventory
+      add_host:
+        name: nexus-server
+        ansible_host: "{{ hcloud_server.hcloud_server.ipv4_address }}"
+        ansible_user: root
+
+    - name: Refresh inventory
+      meta: refresh_inventory
+
+- name: Start Nexus Docker Container on new server
+  hosts: nexus-server
+  become: true
+  tasks:
+    - name: Start Nexus Docker container
+      community.docker.docker_container:
+        name: "nexus"
+        state: started

@@ -1,0 +1,200 @@
+---
+- name: Provision Hetzner Server and Setup Glitchtip Docker Container
+  hosts: localhost
+  gather_facts: false
+  vars:
+    hcloud_token: "{{ lookup('env', 'HCLOUD_TOKEN') }}"
+    server_name: "glitchtip-server"
+    server_type: "cpx41"
+    image: "ubuntu-22.04"
+    ssh_key: "{{ lookup('env', 'SSH_KEY_NAME') }}"
+
+  tasks:
+    - name: Create Hetzner Cloud Server
+      hetzner.hcloud.hcloud_server:
+        api_token: "{{ hcloud_token }}"
+        name: "{{ server_name }}"
+        server_type: "{{ server_type }}"
+        image: "{{ image }}"
+        ssh_keys: "{{ ssh_key }}"
+        state: present
+      register: hcloud_server
+
+    - name: Debug hcloud_server variable
+      debug:
+        var: hcloud_server
+
+    - name: Remove old SSH host key
+      known_hosts:
+        path: /home/mahrezbh/.ssh/known_hosts
+        name: "{{ hcloud_server.hcloud_server.ipv4_address }}"
+        state: absent
+
+    - name: Add new SSH host key
+      shell: ssh-keyscan -H {{ hcloud_server.hcloud_server.ipv4_address }} >> /home/mahrezbh/.ssh/known_hosts
+      ignore_errors: true
+
+    - name: Wait for SSH to be available
+      wait_for:
+        host: "{{ hcloud_server.hcloud_server.ipv4_address }}"
+        port: 22
+        delay: 20
+        timeout: 600
+        state: started
+
+    - name: Verify SSH connection manually
+      shell: ssh -o StrictHostKeyChecking=no root@{{ hcloud_server.hcloud_server.ipv4_address }} echo "SSH is up"
+
+    - name: Add new server to inventory
+      add_host:
+        name: glitchtip-server
+        ansible_host: "{{ hcloud_server.hcloud_server.ipv4_address }}"
+        ansible_user: root
+
+    - name: Refresh inventory
+      meta: refresh_inventory
+
+- name: Configure Glitchtip on new server
+  hosts: glitchtip-server
+  become: true
+  tasks:
+    - name: Update and install Docker
+      apt:
+        update_cache: true
+        name: docker.io
+        state: present
+
+    - name: Install Docker Compose
+      apt:
+        name: docker-compose
+        state: present
+
+    - name: Ensure UFW is installed
+      apt:
+        name: ufw
+        state: present
+
+    - name: Allow ports 22, 80, 443 through UFW
+      ufw:
+        rule: allow
+        port: "22,80,443"
+        proto: tcp
+
+    - name: Enable UFW
+      ufw:
+        state: enabled
+
+    - name: Create a Docker network
+      community.docker.docker_network:
+        name: glitchtip_network
+
+    - name: Run PostgreSQL container for Glitchtip
+      community.docker.docker_container:
+        name: glitchtip-db
+        image: postgres
+        ports:
+          - "5432:5432"
+        env:
+          POSTGRES_DB: "glitchtip"
+          POSTGRES_USER: "glitchtip"
+          POSTGRES_PASSWORD: "glitchtip"
+        networks:
+          - name: glitchtip_network
+        restart_policy: always
+
+    - name: Run Redis container for Glitchtip
+      community.docker.docker_container:
+        name: glitchtip-redis
+        image: redis
+        ports:
+          - "6379:6379"
+        networks:
+          - name: glitchtip_network
+        restart_policy: always
+
+    - name: Pull Glitchtip Docker image
+      community.docker.docker_image:
+        name: glitchtip/glitchtip
+        tag: latest
+        source: pull
+
+    - name: Run Glitchtip container
+      community.docker.docker_container:
+        name: glitchtip
+        image: glitchtip/glitchtip
+        ports:
+          - "8080:8080"
+        env:
+          DATABASE_URL: "postgres://glitchtip:glitchtip@glitchtip-db/glitchtip"
+          REDIS_URL: "redis://glitchtip-redis:6379"
+          GLITCHTIP_SECRET_KEY: "your_secret_key_here"
+        networks:
+          - name: glitchtip_network
+        restart_policy: always
+
+    - name: Run database migrations
+      shell: docker exec glitchtip python manage.py migrate
+
+    - name: Copy create_superuser script to server
+      copy:
+        content: |
+          from django.contrib.auth import get_user_model
+          import os
+
+          User = get_user_model()
+
+          username = os.environ.get('DJANGO_SUPERUSER_USERNAME')
+          email = os.environ.get('DJANGO_SUPERUSER_EMAIL')
+          password = os.environ.get('DJANGO_SUPERUSER_PASSWORD')
+
+          if not User.objects.filter(username=username).exists():
+              User.objects.create_superuser(username=username, email=email, password=password)
+        dest: /root/create_superuser.py
+
+    - name: Run create_superuser script
+      shell: docker exec glitchtip python manage.py shell < /root/create_superuser.py
+      environment:
+        DJANGO_SUPERUSER_USERNAME: "ilef"
+        DJANGO_SUPERUSER_EMAIL: "mahrez.benhamad@gmail.com"
+        DJANGO_SUPERUSER_PASSWORD: "ilefadmin"
+
+    - name: Install Nginx
+      apt:
+        name: nginx
+        state: present
+
+    - name: Configure Nginx as a reverse proxy
+      copy:
+        content: |
+          server {
+              listen 80 default_server;
+              listen [::]:80 default_server;
+
+              server_name _;
+
+              location / {
+                  proxy_pass http://localhost:8080;
+                  proxy_set_header Host $host;
+                  proxy_set_header X-Real-IP $remote_addr;
+                  proxy_set_header X-Forwarded-For $proxy_add_x_forwarded_for;
+                  proxy_set_header X-Forwarded-Proto $scheme;
+              }
+          }
+        dest: /etc/nginx/sites-available/glitchtip
+        mode: "0644"
+
+    - name: Enable Nginx configuration
+      file:
+        src: /etc/nginx/sites-available/glitchtip
+        dest: /etc/nginx/sites-enabled/glitchtip
+        state: link
+
+    - name: Remove default Nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+
+    - name: Restart Nginx
+      service:
+        name: nginx
+        state: restarted

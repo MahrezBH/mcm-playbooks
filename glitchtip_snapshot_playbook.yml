@@ -8,6 +8,8 @@
     server_type: "cx51"
     snapshot_id: "167820892" # Replace with your snapshot ID
     ssh_key: "{{ lookup('env', 'SSH_KEY_NAME') }}"
+    primary_ip4_name: "primary_ip-63956637"
+    primary_ip6_name: "primary_ip-63956638"
 
   tasks:
     - name: Create Hetzner Cloud Server from Snapshot
@@ -18,6 +20,8 @@
         image: "{{ snapshot_id }}"
         ssh_keys: "{{ ssh_key }}"
         state: present
+        ipv4: "{{ primary_ip4_name }}"
+        ipv6: "{{ primary_ip6_name }}"
       register: hcloud_server
 
     - name: Debug hcloud_server variable

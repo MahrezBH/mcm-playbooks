@@ -5,10 +5,12 @@
   vars:
     hcloud_token: "{{ lookup('env', 'HCLOUD_TOKEN') }}"
     server_name: "vault-server"
-    server_type: "cpx41" # Adjust server type as needed
-    snapshot_id: "168776868" # Replace with the actual snapshot ID
+    server_type: "cpx41"
+    snapshot_id: "174861212"
     ssh_key: "{{ lookup('env', 'SSH_KEY_NAME') }}"
-    unseal_keys_file: "/home/mahrezbh/Desktop/pfe/Workspace/playbooks/unseal_keys.json" # Path to the unseal keys file
+    unseal_keys_file: "/home/mahrezbh/Desktop/pfe/Workspace/playbooks/unseal_keys.json"
+    primary_ip4_name: "primary_ip-63985281"
+    primary_ip6_name: "primary_ip-63985283"
 
   tasks:
     - name: Find existing server
@@ -24,11 +26,13 @@
         image: "{{ snapshot_id }}"
         ssh_keys: "{{ ssh_key }}"
         state: present
+        ipv4: "{{ primary_ip4_name }}"
+        ipv6: "{{ primary_ip6_name }}"
       register: hcloud_server_vault
 
-    - name: Debug hcloud_server_vault variable
-      debug:
-        var: hcloud_server_vault
+    # - name: Debug hcloud_server_vault variable
+    #   debug:
+    #     var: hcloud_server_vault
 
     - name: Remove old SSH host key for Vault
       known_hosts:

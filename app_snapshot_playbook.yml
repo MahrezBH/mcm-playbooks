@@ -4,12 +4,12 @@
   gather_facts: false
   vars:
     hcloud_token: "{{ lookup('env', 'HCLOUD_TOKEN') }}"
-    server_name: "nexus-server"
+    server_name: "app-server"
     server_type: "cpx41"
-    snapshot_id: "174861102"
+    snapshot_id: "175219086"
     ssh_key: "{{ lookup('env', 'SSH_KEY_NAME') }}"
-    primary_ip4_name: "primary_ip-63956637"
-    primary_ip6_name: "primary_ip-63956638"
+    primary_ip4_name: "primary_ip-63957751"
+    primary_ip6_name: "primary_ip-63957752"
 
   tasks:
     - name: Create Hetzner Cloud Server from Snapshot
@@ -54,12 +54,3 @@
 
     - name: Refresh inventory
       meta: refresh_inventory
-
-- name: Start Nexus Docker Container on new server
-  hosts: nexus-server
-  become: true
-  tasks:
-    - name: Start Nexus Docker container
-      community.docker.docker_container:
-        name: "nexus"
-        state: started
